@@ -72,6 +72,13 @@ class Vehicle:
         self._cb_state = self._cb_update = self._cb_sensors = self._cb_sim_state = None
         self._cb_sim_start = self._cb_sim_stop = self._cb_render = None
 
+        self._body_rigid_prim: RigidPrim | None = None
+        self._rigid_prims: dict[str, RigidPrim] = {}
+        # Per-vehicle scratch buffers; the physics callbacks use them synchronously.
+        self._force_buffer = np.empty((1, 3), dtype=np.float32)
+        self._torque_buffer = np.empty((1, 3), dtype=np.float32)
+        self._force_position_buffer = np.empty((1, 3), dtype=np.float32)
+
         # Get the current stage
         self._current_stage = omni.usd.get_context().get_stage()
 
@@ -94,9 +101,6 @@ class Vehicle:
         xformable.AddTranslateOp().Set(Gf.Vec3d(init_pos[0], init_pos[1], init_pos[2]))
         # Convert [qx, qy, qz, qw] → [qw, qx, qy, qz] for USD; use Quatf (single precision) to match the op type in NVIDIA USD assets
         xformable.AddOrientOp().Set(Gf.Quatf(init_orientation[3], init_orientation[0], init_orientation[1], init_orientation[2]))
-
-        # Body rigid prim — created lazily after simulation starts
-        self._body_rigid_prim: RigidPrim | None = None
 
         # Add the current vehicle to the vehicle manager, so that it knows
         # that a vehicle was instantiated
@@ -165,22 +169,30 @@ class Vehicle:
         'remove_vehicle' from the VehicleManager in order to remove the vehicle from the list of active vehicles.
         """
         # Deregister all SimulationManager callbacks
-        for cb_id in (self._cb_state, self._cb_update, self._cb_sensors, self._cb_sim_state,
-                      self._cb_sim_start, self._cb_sim_stop):
+        for name in ("_cb_state", "_cb_update", "_cb_sensors", "_cb_sim_state", "_cb_sim_start", "_cb_sim_stop"):
+            cb_id = getattr(self, name, None)
             if cb_id is not None:
                 try:
                     SimulationManager.deregister_callback(cb_id)
                 except Exception:
                     pass
+                setattr(self, name, None)
         # Deregister RenderingManager callback
-        if self._cb_render is not None:
+        if getattr(self, "_cb_render", None) is not None:
             try:
                 RenderingManager.deregister_callback(self._cb_render)
             except Exception:
                 pass
+            self._cb_render = None
 
         # Remove this object from the vehicleHandler
-        VehicleManager.get_vehicle_manager().remove_vehicle(self._stage_prefix)
+        stage_prefix = getattr(self, "_stage_prefix", None)
+        if stage_prefix is not None:
+            try:
+                VehicleManager.get_vehicle_manager().remove_vehicle(stage_prefix)
+            except Exception:
+                # The manager may already be shutting down.
+                pass
 
     """
     Properties
@@ -223,7 +235,10 @@ class Vehicle:
             self._sim_running = True
 
             # Create (or re-create) the rigid prim wrapper now that physics is ready
-            self._body_rigid_prim = RigidPrim(paths=self._stage_prefix + "/body")
+            self._rigid_prims.clear()
+            body_path = self._stage_prefix + "/body"
+            self._body_rigid_prim = RigidPrim(paths=body_path)
+            self._rigid_prims[body_path] = self._body_rigid_prim
 
             # Initialize the sensors
             for sensor in self._sensors:
@@ -246,6 +261,7 @@ class Vehicle:
 
             # Release the rigid prim wrapper so it can be re-created fresh on next play
             self._body_rigid_prim = None
+            self._rigid_prims.clear()
 
             # Stop the sensors
             for sensor in self._sensors:
@@ -261,6 +277,23 @@ class Vehicle:
 
             self.stop()
 
+    def _get_rigid_prim(self, body_part):
+        """Reuse physics wrappers until stop/start or an invalid physics entity requires rebuilding."""
+        if self._body_rigid_prim is None:
+            return None
+
+        prim_path = self._stage_prefix + body_part
+        rigid_prim = self._rigid_prims.get(prim_path)
+        if rigid_prim is None or not rigid_prim.is_physics_tensor_entity_valid():
+            rigid_prim = RigidPrim(paths=prim_path)
+            if not rigid_prim.is_physics_tensor_entity_valid():
+                self._rigid_prims.pop(prim_path, None)
+                return None
+            self._rigid_prims[prim_path] = rigid_prim
+            if body_part == "/body":
+                self._body_rigid_prim = rigid_prim
+        return rigid_prim
+
     def apply_force(self, force, pos=[0.0, 0.0, 0.0], body_part="/body"):
         """
         Method that will apply a force on the rigidbody, on the part specified in the 'body_part' at its relative position
@@ -271,16 +304,15 @@ class Vehicle:
             pos (list): Position offset in local body frame. Defaults to [0.0, 0.0, 0.0].
             body_part (str): Rigid body sub-path relative to the vehicle stage prefix. Defaults to "/body".
         """
-        if self._body_rigid_prim is None or not self._body_rigid_prim.is_physics_tensor_entity_valid():
+        rigid_prim = self._get_rigid_prim(body_part)
+        if rigid_prim is None:
             return
 
-        prim_path = self._stage_prefix + body_part
-        rigid_prim = RigidPrim(paths=prim_path) if body_part != "/body" else self._body_rigid_prim
-
-        forces = np.array([[force[0], force[1], force[2]]], dtype=np.float32)
-        torques = np.zeros((1, 3), dtype=np.float32)
-        positions = np.array([[pos[0], pos[1], pos[2]]], dtype=np.float32)
-        rigid_prim.apply_forces_and_torques_at_pos(forces=forces, torques=torques, positions=positions, local_frame=True)
+        self._force_buffer[0] = force
+        self._force_position_buffer[0] = pos
+        rigid_prim.apply_forces_and_torques_at_pos(
+            forces=self._force_buffer, positions=self._force_position_buffer, local_frame=True
+        )
 
     def apply_torque(self, torque, body_part="/body"):
         """
@@ -290,16 +322,12 @@ class Vehicle:
             torque (list): A 3-dimensional vector of floats with the torque [Tx, Ty, Tz] on the body axis of the vehicle according to a FLU convention.
             body_part (str): Rigid body sub-path relative to the vehicle stage prefix. Defaults to "/body".
         """
-        if self._body_rigid_prim is None or not self._body_rigid_prim.is_physics_tensor_entity_valid():
+        rigid_prim = self._get_rigid_prim(body_part)
+        if rigid_prim is None:
             return
 
-        prim_path = self._stage_prefix + body_part
-        rigid_prim = RigidPrim(paths=prim_path) if body_part != "/body" else self._body_rigid_prim
-
-        forces = np.zeros((1, 3), dtype=np.float32)
-        torques = np.array([[torque[0], torque[1], torque[2]]], dtype=np.float32)
-        positions = np.zeros((1, 3), dtype=np.float32)
-        rigid_prim.apply_forces_and_torques_at_pos(forces=forces, torques=torques, positions=positions, local_frame=True)
+        self._torque_buffer[0] = torque
+        rigid_prim.apply_forces_and_torques_at_pos(torques=self._torque_buffer, local_frame=True)
 
     def update_state(self, dt: float, context=None):
         """

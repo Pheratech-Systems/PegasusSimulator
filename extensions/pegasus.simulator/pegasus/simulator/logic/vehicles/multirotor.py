@@ -218,6 +218,7 @@ class Multirotor(Vehicle):
         for i in range(self._thrusters._num_rotors):
             rotor_prim = stage.GetPrimAtPath(self._stage_prefix + "/rotor" + str(i))
             rotor_world = xform_cache.GetLocalToWorldTransform(rotor_prim)
+            # USD uses row vectors: rotor-local -> world -> body. Reversing this order is incorrect.
             rotor_in_body = rotor_world * world_to_body
             translation = rotor_in_body.ExtractTranslation()
             relative_positions.append([translation[0], translation[1], translation[2]])

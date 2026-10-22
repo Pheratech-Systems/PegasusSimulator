@@ -55,7 +55,7 @@ class Person:
     @classmethod
     def _ensure_assets_root_path(cls):
         """Resolve assets_root_path on first call. Called from __init__ and static helpers."""
-        if cls.assets_root_path is not None:
+        if cls.assets_root_path:
             return
         if cls.people_asset_folder:
             cls.assets_root_path = cls.people_asset_folder
@@ -65,7 +65,11 @@ class Person:
                 if root_path:
                     cls.assets_root_path = f"{root_path}/Isaac/People/Characters"
             except Exception as e:
-                carb.log_error(f"Could not resolve Isaac Sim asset root path: {e}")
+                raise RuntimeError("Could not resolve the Isaac Sim asset root path.") from e
+        if not cls.assets_root_path:
+            raise RuntimeError(
+                "Isaac Sim asset root is unavailable. Configure the asset root or set Person.people_asset_folder."
+            )
 
     def __init__(
         self,
@@ -85,6 +89,10 @@ class Person:
             init_yaw (float): The initial orientation of the person in rad. Defaults to 0.0.
             controller (PersonController): A controller to add some custom behaviour to the movement of the person. Defaults to None.
         """
+
+        # Cleanup must also work if asset loading or callback registration fails.
+        self._cb_state = self._cb_update = None
+        self._cb_sim_start = self._cb_sim_stop = None
 
         # Get the current stage
         self._current_stage = omni.usd.get_context().get_stage()
@@ -150,11 +158,15 @@ class Person:
         self._cb_sim_stop = SimulationManager.register_callback(self._on_sim_stopped, SimulationEvent.SIMULATION_STOPPED)
 
     def __del__(self):
-        for cb_id in (self._cb_state, self._cb_update, self._cb_sim_start, self._cb_sim_stop):
-            try:
-                SimulationManager.deregister_callback(cb_id)
-            except Exception:
-                pass
+        for name in ("_cb_state", "_cb_update", "_cb_sim_start", "_cb_sim_stop"):
+            cb_id = getattr(self, name, None)
+            if cb_id is not None:
+                try:
+                    SimulationManager.deregister_callback(cb_id)
+                except Exception:
+                    # The simulation manager may already be shutting down.
+                    pass
+                setattr(self, name, None)
 
     @property
     def state(self):
@@ -369,13 +381,18 @@ class Person:
 
     @staticmethod
     def get_character_asset_list():
-        Person._ensure_assets_root_path()
+        """List available character folders, or return [] with a diagnostic when assets are unavailable."""
+        try:
+            Person._ensure_assets_root_path()
+        except RuntimeError as e:
+            carb.log_error(str(e))
+            return []
         # List all files in characters directory
         result, folder_list = omni.client.list("{}/".format(Person.assets_root_path))
 
         if result != omni.client.Result.OK:
-            carb.log_error("Unable to get character assets from provided asset root path.")
-            return
+            carb.log_error(f"Unable to list character assets at {Person.assets_root_path}: {result}")
+            return []
 
         # Prune items from folder list that are not directories.
         pruned_folder_list = [folder.relative_path for folder in folder_list 
@@ -386,14 +403,16 @@ class Person:
     @staticmethod
     def get_path_for_character_prim(agent_name):
 
-        # Check if a folder with agent_name exists. If exists we load the character, else we load a random character
+        # Spawning requires a resolved root and a named character; fail before adding USD references.
+        Person._ensure_assets_root_path()
+        if not agent_name:
+            raise ValueError("A character name is required to spawn a person.")
         agent_folder = "{}/{}".format(Person.assets_root_path, agent_name)
         result, properties = omni.client.stat(agent_folder)
 
-        # Attempt to load the character if it exists, otherwise load a random character
+        # A missing asset is a spawn error, rather than a reference to None.
         if result != omni.client.Result.OK:
-            carb.log_error("Character folder does not exist.")
-            return None
+            raise FileNotFoundError(f"Character folder is unavailable: {agent_folder} ({result})")
         
         # Get the usd present in the character folder
         character_folder = "{}/{}".format(Person.assets_root_path, agent_name)
@@ -407,13 +426,10 @@ class Person:
         result, folder_list = omni.client.list(character_folder_path)
         
         if result != omni.client.Result.OK:
-            carb.log_error("Unable to read character folder path at {}".format(character_folder_path))
-            return
+            raise FileNotFoundError(f"Unable to read character folder: {character_folder_path} ({result})")
 
         for item in folder_list:
             if item.relative_path.endswith(".usd"):
                 return item.relative_path
 
-        carb.log_error("Unable to file a .usd file in {} character folder".format(character_folder_path))
-
-    
+        raise FileNotFoundError(f"No .usd character asset found in {character_folder_path}")
