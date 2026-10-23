@@ -60,6 +60,9 @@ class MultirotorConfig:
 class Multirotor(Vehicle):
     """Multirotor class - It defines a base interface for creating a multirotor
     """
+
+    _PROPELLER_VISUAL_UPDATE_PERIOD = 1.0 / 60.0
+
     def __init__(
         self,
         # Simulation specific configurations
@@ -94,18 +97,21 @@ class Multirotor(Vehicle):
         self._articulation_validated = False
         # Cache DOF indices for rotor joints keyed by rotor number
         self._rotor_dof_indices: dict[int, int] = {}
+        self._propeller_visual_elapsed = 0.0
 
     def start(self):
         """Set up the articulation handle when simulation starts."""
         self._articulation = Articulation(paths=self._stage_prefix)
         self._articulation_validated = False
         self._rotor_dof_indices = {}
+        self._propeller_visual_elapsed = 0.0
 
     def stop(self):
         """Release the articulation handle when simulation stops."""
         self._articulation = None
         self._articulation_validated = False
         self._rotor_dof_indices = {}
+        self._propeller_visual_elapsed = 0.0
 
     def update(self, dt: float, context=None):
         """
@@ -129,14 +135,19 @@ class Multirotor(Vehicle):
         # Get the desired forces to apply to the vehicle
         forces_z, _, rolling_moment = self._thrusters.update(self._state, dt)
 
-        # Apply force to each rotor
+        # Apply force to each rotor at the full physics rate.
         for i in range(4):
 
             # Apply the force in Z on the rotor frame
             self.apply_force([0.0, 0.0, forces_z[i]], body_part="/rotor" + str(i))
 
-            # Generate the rotating propeller visual effect
-            self.handle_propeller_visual(i, forces_z[i])
+        # The joint target is held by PhysX between updates, so refreshing the
+        # visual propeller animation at 60 Hz does not alter the 250 Hz thrust,
+        # drag, rigid-body, or collision calculations.
+        self._propeller_visual_elapsed += dt
+        if self._propeller_visual_elapsed >= self._PROPELLER_VISUAL_UPDATE_PERIOD:
+            self._propeller_visual_elapsed %= self._PROPELLER_VISUAL_UPDATE_PERIOD
+            self._set_propeller_visuals(enumerate(forces_z))
 
         # Apply the torque to the body frame of the vehicle that corresponds to the rolling moment
         self.apply_torque([0.0, 0.0, rolling_moment], "/body")
@@ -166,15 +177,8 @@ class Multirotor(Vehicle):
         except Exception:
             return None
 
-    def handle_propeller_visual(self, rotor_number: int, force: float):
-        """
-        Auxiliar method used to set the joint velocity of each rotor (for animation purposes) based on the
-        amount of force being applied on each joint.
-
-        Args:
-            rotor_number (int): The number of the rotor to generate the rotation animation.
-            force (float): The force that is being applied on that rotor.
-        """
+    def _set_propeller_visuals(self, rotor_forces):
+        """Set one or more rotor animation targets in a single articulation call."""
         if self._articulation is None:
             return
         if not self._articulation_validated:
@@ -182,21 +186,43 @@ class Multirotor(Vehicle):
                 return
             self._articulation_validated = True
 
-        dof_idx = self._get_rotor_dof_index(rotor_number)
-        if dof_idx is None:
-            return
+        velocities = []
+        dof_indices = []
+        for rotor_number, force in rotor_forces:
+            dof_idx = self._get_rotor_dof_index(rotor_number)
+            if dof_idx is None:
+                continue
 
-        # Spinning when armed but not applying force
-        if 0.0 < force < 0.1:
-            velocity = 5.0 * self._thrusters.rot_dir[rotor_number]
-        # Spinning when armed and applying force
-        elif 0.1 <= force:
-            velocity = 100.0 * self._thrusters.rot_dir[rotor_number]
-        # Not spinning
-        else:
-            velocity = 0.0
+            # Spinning when armed but not applying force
+            if 0.0 < force < 0.1:
+                velocity = 5.0 * self._thrusters.rot_dir[rotor_number]
+            # Spinning when armed and applying force
+            elif 0.1 <= force:
+                velocity = 100.0 * self._thrusters.rot_dir[rotor_number]
+            # Not spinning
+            else:
+                velocity = 0.0
 
-        self._articulation.set_dof_velocities([[velocity]], dof_indices=[dof_idx])
+            velocities.append(velocity)
+            dof_indices.append(dof_idx)
+
+        if velocities:
+            self._articulation.set_dof_velocities(
+                [velocities],
+                dof_indices=dof_indices,
+            )
+
+    def handle_propeller_visual(self, rotor_number: int, force: float):
+        """Set one rotor animation target immediately.
+
+        The physics hot path uses the batched 60 Hz updater; this method remains
+        available for callers that need to update an individual rotor directly.
+
+        Args:
+            rotor_number (int): The number of the rotor to generate the rotation animation.
+            force (float): The force that is being applied on that rotor.
+        """
+        self._set_propeller_visuals([(rotor_number, force)])
 
     def force_and_torques_to_velocities(self, force: float, torque: np.ndarray):
         """

@@ -351,10 +351,13 @@ class MultirotorVisualTests(unittest.TestCase):
             methods={
                 "start",
                 "stop",
+                "update",
                 "_get_rotor_dof_index",
+                "_set_propeller_visuals",
                 "handle_propeller_visual",
             },
         )
+        self.Multirotor._PROPELLER_VISUAL_UPDATE_PERIOD = 1.0 / 60.0
 
     def test_articulation_retries_until_ready_then_caches_validity(self):
         drone = self.Multirotor()
@@ -379,6 +382,44 @@ class MultirotorVisualTests(unittest.TestCase):
         self.assertIsNone(drone._articulation)
         self.assertFalse(drone._articulation_validated)
         self.assertEqual(drone._rotor_dof_indices, {})
+
+    def test_physics_update_batches_visual_targets_at_sixty_hz(self):
+        drone = self.Multirotor()
+        drone._stage_prefix = "/World/drone"
+        drone._backends = []
+        drone._thrusters = Mock()
+        drone._thrusters._num_rotors = 4
+        drone._thrusters.rot_dir = [1, -1, 1, -1]
+        drone._thrusters.update.return_value = (
+            [0.2, 0.2, 0.2, 0.2],
+            None,
+            0.05,
+        )
+        drone._drag = Mock()
+        drone._drag.update.return_value = [0.0, 0.0, 0.0]
+        drone._state = Mock()
+        drone.apply_force = Mock()
+        drone.apply_torque = Mock()
+        drone._propeller_visual_elapsed = 0.0
+        drone.start()
+        articulation = FakeArticulation.instances[0]
+        articulation.valid = True
+
+        for _ in range(250):
+            drone.update(0.004)
+
+        self.assertEqual(drone.apply_force.call_count, 250 * 5)
+        self.assertEqual(drone.apply_torque.call_count, 250)
+        self.assertEqual(len(articulation.velocity_calls), 60)
+        self.assertTrue(
+            all(call[0] == [[100.0, -100.0, 100.0, -100.0]]
+                for call in articulation.velocity_calls)
+        )
+        self.assertTrue(
+            all(call[1] == [0, 1, 2, 3]
+                for call in articulation.velocity_calls)
+        )
+        self.assertEqual(articulation.index_lookups, 4)
 
 
 class PersonTests(unittest.TestCase):
