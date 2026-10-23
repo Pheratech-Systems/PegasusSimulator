@@ -73,6 +73,7 @@ class Vehicle:
         self._cb_sim_start = self._cb_sim_stop = self._cb_render = None
 
         self._body_rigid_prim: RigidPrim | None = None
+        self._body_rigid_prim_validated = False
         self._rigid_prims: dict[str, RigidPrim] = {}
         # Per-vehicle scratch buffers; the physics callbacks use them synchronously.
         self._force_buffer = np.empty((1, 3), dtype=np.float32)
@@ -109,10 +110,6 @@ class Vehicle:
         # Variable that will hold the current state of the vehicle
         self._state = State()
 
-        # Register physics callbacks
-        self._cb_state = SimulationManager.register_callback(self.update_state, SimulationEvent.PHYSICS_POST_STEP)
-        self._cb_update = SimulationManager.register_callback(self.update, SimulationEvent.PHYSICS_POST_STEP)
-
         # Set the flag that signals if the simulation is running or not
         self._sim_running = False
 
@@ -128,9 +125,6 @@ class Vehicle:
         for sensor in self._sensors:
             sensor.initialize(self, PegasusInterface().latitude, PegasusInterface().longitude, PegasusInterface().altitude)
 
-        # Add callbacks to the physics engine to update each sensor at every timestep
-        self._cb_sensors = SimulationManager.register_callback(self.update_sensors, SimulationEvent.PHYSICS_POST_STEP)
-
         # --------------------------------------------------------------------
         # -------------------- Add the graphical sensors to the vehicle ------
         # --------------------------------------------------------------------
@@ -139,8 +133,13 @@ class Vehicle:
         for graphical_sensor in self._graphical_sensors:
             graphical_sensor.initialize(self)
 
-        # Add callback to the rendering engine to update each graphical sensor
-        self._cb_render = RenderingManager.register_callback(RenderingEvent.NEW_FRAME, callback=self.update_graphical_sensors)
+        # Avoid one render-frame callback per vehicle when there is no camera,
+        # lidar, or other graphical sensor to update.
+        if self._graphical_sensors:
+            self._cb_render = RenderingManager.register_callback(
+                RenderingEvent.NEW_FRAME,
+                callback=self.update_graphical_sensors,
+            )
 
         # --------------------------------------------------------------------
         # -------------------- Add the graphs to the vehicle -----------------
@@ -159,8 +158,12 @@ class Vehicle:
         for backend in self._backends:
             backend.initialize(self)
 
-        # Callback for sending state to backends on every physics step
-        self._cb_sim_state = SimulationManager.register_callback(self.update_sim_state, SimulationEvent.PHYSICS_POST_STEP)
+        # Use one physics callback per vehicle while preserving the original
+        # state -> dynamics -> sensors -> backend-state execution order.
+        self._cb_update = SimulationManager.register_callback(
+            self._physics_step,
+            SimulationEvent.PHYSICS_POST_STEP,
+        )
 
 
     def __del__(self):
@@ -238,6 +241,7 @@ class Vehicle:
             self._rigid_prims.clear()
             body_path = self._stage_prefix + "/body"
             self._body_rigid_prim = RigidPrim(paths=body_path)
+            self._body_rigid_prim_validated = False
             self._rigid_prims[body_path] = self._body_rigid_prim
 
             # Initialize the sensors
@@ -261,6 +265,7 @@ class Vehicle:
 
             # Release the rigid prim wrapper so it can be re-created fresh on next play
             self._body_rigid_prim = None
+            self._body_rigid_prim_validated = False
             self._rigid_prims.clear()
 
             # Stop the sensors
@@ -284,7 +289,21 @@ class Vehicle:
 
         prim_path = self._stage_prefix + body_part
         rigid_prim = self._rigid_prims.get(prim_path)
-        if rigid_prim is None or not rigid_prim.is_physics_tensor_entity_valid():
+        # Tensor entities are stable for a play/stop lifecycle. Validate each
+        # wrapper until it is ready, then rely on _on_sim_stopped() to clear
+        # the cache before the next lifecycle.
+        needs_wrapper = rigid_prim is None
+        if (
+            body_part == "/body"
+            and rigid_prim is not None
+            and not self._body_rigid_prim_validated
+        ):
+            if rigid_prim.is_physics_tensor_entity_valid():
+                self._body_rigid_prim_validated = True
+            else:
+                needs_wrapper = True
+
+        if needs_wrapper:
             rigid_prim = RigidPrim(paths=prim_path)
             if not rigid_prim.is_physics_tensor_entity_valid():
                 self._rigid_prims.pop(prim_path, None)
@@ -292,6 +311,7 @@ class Vehicle:
             self._rigid_prims[prim_path] = rigid_prim
             if body_part == "/body":
                 self._body_rigid_prim = rigid_prim
+                self._body_rigid_prim_validated = True
         return rigid_prim
 
     def apply_force(self, force, pos=[0.0, 0.0, 0.0], body_part="/body"):
@@ -347,12 +367,6 @@ class Vehicle:
         pos = positions.numpy()[0]        # [x, y, z]
         quat_wxyz = orientations.numpy()[0]  # [qw, qx, qy, qz]
 
-        # Get the attitude via the USD rotation (more accurate for orientation)
-        prim = self._current_stage.GetPrimAtPath(self._stage_prefix + "/body")
-        rotation_quat = get_world_transform_xform(prim).GetQuaternion()
-        rotation_quat_real = rotation_quat.GetReal()
-        rotation_quat_img = rotation_quat.GetImaginary()
-
         # Get the linear and angular velocities
         # get_velocities() returns (linear wp.array Nx3, angular wp.array Nx3) both in world frame
         linear_vels, angular_vels = self._body_rigid_prim.get_velocities()
@@ -372,22 +386,34 @@ class Vehicle:
 
         # Get the quaternion in the [qx, qy, qz, qw] standard
         self._state.attitude = np.array(
-            [rotation_quat_img[0], rotation_quat_img[1], rotation_quat_img[2], rotation_quat_real]
+            [quat_wxyz[1], quat_wxyz[2], quat_wxyz[3], quat_wxyz[0]],
+            dtype=np.float64,
         )
 
         # Express the velocity of the vehicle in the inertial frame X_dot = [x_dot, y_dot, z_dot]
         self._state.linear_velocity = np.array(linear_vel)
 
-        # The linear velocity V = [u,v,w] of the vehicle's body frame expressed in the body frame of reference
-        self._state.linear_body_velocity = (
-            Rotation.from_quat(self._state.attitude).inv().apply(self._state.linear_velocity)
+        # Reuse the same inertial-to-body rotation for both vectors. This is
+        # mathematically identical for the PhysX tensor attitude above.
+        inertial_to_body = Rotation.from_quat(self._state.attitude).inv()
+        self._state.linear_body_velocity = inertial_to_body.apply(
+            self._state.linear_velocity
         )
 
         # omega = [p, q, r] expressed in body frame
-        self._state.angular_velocity = Rotation.from_quat(self._state.attitude).inv().apply(np.array(ang_vel_world))
+        self._state.angular_velocity = inertial_to_body.apply(
+            np.array(ang_vel_world)
+        )
 
         # The acceleration of the vehicle expressed in the inertial frame
         self._state.linear_acceleration = linear_acceleration
+
+    def _physics_step(self, dt: float, context=None):
+        """Run the vehicle's per-step work through one physics callback."""
+        self.update_state(dt, context)
+        self.update(dt, context)
+        self.update_sensors(dt, context)
+        self.update_sim_state(dt, context)
 
     def start(self):
         """

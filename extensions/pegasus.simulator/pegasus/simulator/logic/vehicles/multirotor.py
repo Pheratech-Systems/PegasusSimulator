@@ -91,17 +91,20 @@ class Multirotor(Vehicle):
 
         # Articulation handle — created lazily after simulation starts (physics tensor entity required)
         self._articulation: Articulation | None = None
+        self._articulation_validated = False
         # Cache DOF indices for rotor joints keyed by rotor number
         self._rotor_dof_indices: dict[int, int] = {}
 
     def start(self):
         """Set up the articulation handle when simulation starts."""
         self._articulation = Articulation(paths=self._stage_prefix)
+        self._articulation_validated = False
         self._rotor_dof_indices = {}
 
     def stop(self):
         """Release the articulation handle when simulation stops."""
         self._articulation = None
+        self._articulation_validated = False
         self._rotor_dof_indices = {}
 
     def update(self, dt: float, context=None):
@@ -172,8 +175,12 @@ class Multirotor(Vehicle):
             rotor_number (int): The number of the rotor to generate the rotation animation.
             force (float): The force that is being applied on that rotor.
         """
-        if self._articulation is None or not self._articulation.is_physics_tensor_entity_valid():
+        if self._articulation is None:
             return
+        if not self._articulation_validated:
+            if not self._articulation.is_physics_tensor_entity_valid():
+                return
+            self._articulation_validated = True
 
         dof_idx = self._get_rotor_dof_index(rotor_number)
         if dof_idx is None:

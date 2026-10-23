@@ -39,10 +39,12 @@ class FakeRigidPrim:
     def __init__(self, paths):
         self.paths = paths
         self.physics_valid = self.ready
+        self.validity_checks = 0
         self.calls = []
         self.instances.append(self)
 
     def is_physics_tensor_entity_valid(self):
+        self.validity_checks += 1
         return self.physics_valid
 
     def apply_forces_and_torques_at_pos(self, **kwargs):
@@ -59,9 +61,38 @@ class VehicleTests(unittest.TestCase):
         self.sim = Mock()
         self.render = Mock()
         self.manager = Mock()
+        self.stage = Mock()
+        self.prim = Mock()
+        self.stage.GetPrimAtPath.return_value = self.prim
+        self.xformable = Mock()
+        omni = Mock()
+        omni.usd.get_context.return_value.get_stage.return_value = self.stage
         self.namespace = dict(np=np, RigidPrim=FakeRigidPrim, SimulationManager=self.sim,
-                              RenderingManager=self.render, VehicleManager=self.manager, omni=Mock())
+                              RenderingManager=self.render, VehicleManager=self.manager, omni=omni,
+                              get_stage_next_free_path=lambda stage, prefix, _: prefix,
+                              stage_utils=SimpleNamespace(define_prim=Mock()),
+                              UsdGeom=SimpleNamespace(Xformable=Mock(return_value=self.xformable)),
+                              Gf=SimpleNamespace(Vec3d=lambda *values: values,
+                                                 Quatf=lambda *values: values),
+                              State=Mock,
+                              SimulationEvent=SimpleNamespace(
+                                  PHYSICS_POST_STEP="physics",
+                                  SIMULATION_STARTED="started",
+                                  SIMULATION_STOPPED="stopped",
+                              ),
+                              RenderingEvent=SimpleNamespace(NEW_FRAME="frame"),
+                              PegasusInterface=Mock)
         self.Vehicle = load_class("vehicles/vehicle.py", "Vehicle", self.namespace)
+
+    def constructed_vehicle(self, graphical_sensors):
+        return self.Vehicle(
+            "/World/drone",
+            usd_path="iris.usd",
+            sensors=[],
+            graphical_sensors=graphical_sensors,
+            graphs=[],
+            backends=[],
+        )
 
     def vehicle(self, prefix="/World/drone"):
         vehicle = self.Vehicle.__new__(self.Vehicle)
@@ -106,15 +137,111 @@ class VehicleTests(unittest.TestCase):
         self.assertTrue(all(call["local_frame"] for call in rotor.calls))
         self.assertEqual(vehicle._force_buffer.dtype, np.float32)
 
-    def test_invalid_wrapper_is_rebuilt_once(self):
+    def test_rotor_wrapper_is_validated_once_per_play_lifecycle(self):
         vehicle = self.vehicle()
         vehicle.apply_force([0, 0, 1], body_part="/rotor0")
-        old = vehicle._rigid_prims[vehicle._stage_prefix + "/rotor0"]
-        old.physics_valid = False
-        vehicle.apply_torque([0, 0, 1], "/rotor0")
-        vehicle.apply_force([0, 0, 2], body_part="/rotor0")
-        self.assertEqual(len(FakeRigidPrim.instances), 3)
-        self.assertEqual(len(old.calls), 1)
+        rotor = vehicle._rigid_prims[vehicle._stage_prefix + "/rotor0"]
+        for _ in range(100):
+            vehicle.apply_torque([0, 0, 1], "/rotor0")
+            vehicle.apply_force([0, 0, 2], body_part="/rotor0")
+        self.assertEqual(len(FakeRigidPrim.instances), 2)
+        self.assertEqual(rotor.validity_checks, 1)
+
+    def test_body_wrapper_is_validated_once_per_play_lifecycle(self):
+        vehicle = self.vehicle()
+        body = vehicle._body_rigid_prim
+        for _ in range(100):
+            vehicle.apply_force([0, 0, 1])
+            vehicle.apply_torque([0, 0, 0.1])
+        self.assertEqual(body.validity_checks, 1)
+        self.assertEqual(len(FakeRigidPrim.instances), 1)
+        self.assertTrue(vehicle._body_rigid_prim_validated)
+
+    def test_body_wrapper_retries_until_replacement_is_ready(self):
+        vehicle = self.vehicle()
+        old_body = vehicle._body_rigid_prim
+        old_body.physics_valid = False
+        FakeRigidPrim.ready = False
+        vehicle.apply_force([0, 0, 1])
+        self.assertFalse(vehicle._body_rigid_prim_validated)
+        self.assertNotIn(
+            vehicle._stage_prefix + "/body",
+            vehicle._rigid_prims,
+        )
+
+        FakeRigidPrim.ready = True
+        vehicle.apply_force([0, 0, 2])
+        self.assertIsNot(vehicle._body_rigid_prim, old_body)
+        self.assertTrue(vehicle._body_rigid_prim_validated)
+        self.assertEqual(len(vehicle._body_rigid_prim.calls), 1)
+
+    def test_state_update_uses_tensor_attitude_and_one_rotation(self):
+        rotation_api = Mock()
+        rotation_api.from_quat.side_effect = (
+            __import__("scipy.spatial.transform", fromlist=["Rotation"])
+            .Rotation.from_quat
+        )
+        world_transform_query = Mock(
+            side_effect=AssertionError("USD attitude query must not run")
+        )
+        self.namespace["Rotation"] = rotation_api
+        self.namespace["get_world_transform_xform"] = world_transform_query
+
+        array = lambda values: SimpleNamespace(
+            numpy=lambda: np.asarray([values], dtype=np.float32)
+        )
+        body = Mock()
+        body.get_world_poses.return_value = (
+            array([1.0, 2.0, 3.0]),
+            array([1.0, 0.0, 0.0, 0.0]),
+        )
+        body.get_velocities.return_value = (
+            array([4.0, 5.0, 6.0]),
+            array([0.1, 0.2, 0.3]),
+        )
+
+        vehicle = self.Vehicle.__new__(self.Vehicle)
+        vehicle._body_rigid_prim = body
+        vehicle._current_stage = Mock()
+        vehicle._stage_prefix = "/World/drone"
+        vehicle._state = SimpleNamespace(linear_velocity=np.zeros(3))
+        vehicle.update_state(0.004)
+
+        world_transform_query.assert_not_called()
+        rotation_api.from_quat.assert_called_once()
+        np.testing.assert_array_equal(
+            vehicle._state.attitude,
+            [0.0, 0.0, 0.0, 1.0],
+        )
+        np.testing.assert_allclose(
+            vehicle._state.linear_body_velocity,
+            [4.0, 5.0, 6.0],
+        )
+        np.testing.assert_allclose(
+            vehicle._state.angular_velocity,
+            [0.1, 0.2, 0.3],
+        )
+
+    def test_physics_dispatcher_preserves_callback_order_and_arguments(self):
+        vehicle = self.Vehicle.__new__(self.Vehicle)
+        calls = []
+        vehicle.update_state = lambda dt, context: calls.append(("state", dt, context))
+        vehicle.update = lambda dt, context: calls.append(("dynamics", dt, context))
+        vehicle.update_sensors = lambda dt, context: calls.append(("sensors", dt, context))
+        vehicle.update_sim_state = lambda dt, context: calls.append(("backend_state", dt, context))
+
+        context = object()
+        vehicle._physics_step(0.004, context)
+
+        self.assertEqual(
+            calls,
+            [
+                ("state", 0.004, context),
+                ("dynamics", 0.004, context),
+                ("sensors", 0.004, context),
+                ("backend_state", 0.004, context),
+            ],
+        )
 
     def test_unready_replacement_is_not_used_or_cached(self):
         vehicle = self.vehicle()
@@ -155,6 +282,103 @@ class VehicleTests(unittest.TestCase):
             vehicle.__init__("/World/drone")
         vehicle.__del__()
         self.manager.get_vehicle_manager.assert_not_called()
+
+    def test_no_graphical_sensors_skip_render_callback(self):
+        vehicle = self.constructed_vehicle([])
+        self.assertIsNone(vehicle._cb_render)
+        self.render.register_callback.assert_not_called()
+        vehicle.__del__()
+
+    def test_constructor_registers_one_physics_callback(self):
+        vehicle = self.constructed_vehicle([])
+        physics_callbacks = [
+            call
+            for call in self.sim.register_callback.call_args_list
+            if call.args[1] == "physics"
+        ]
+        self.assertEqual(len(physics_callbacks), 1)
+        self.assertEqual(physics_callbacks[0].args[0], vehicle._physics_step)
+        self.assertIsNone(vehicle._cb_state)
+        self.assertIsNone(vehicle._cb_sensors)
+        self.assertIsNone(vehicle._cb_sim_state)
+        vehicle.__del__()
+
+    def test_graphical_sensor_still_registers_render_callback(self):
+        self.render.register_callback.return_value = 17
+        sensor = Mock()
+        vehicle = self.constructed_vehicle([sensor])
+        sensor.initialize.assert_called_once_with(vehicle)
+        self.render.register_callback.assert_called_once_with(
+            "frame",
+            callback=vehicle.update_graphical_sensors,
+        )
+        self.assertEqual(vehicle._cb_render, 17)
+        vehicle.__del__()
+
+
+class FakeArticulation:
+    instances = []
+
+    def __init__(self, paths):
+        self.paths = paths
+        self.valid = False
+        self.validity_checks = 0
+        self.index_lookups = 0
+        self.velocity_calls = []
+        self.instances.append(self)
+
+    def is_physics_tensor_entity_valid(self):
+        self.validity_checks += 1
+        return self.valid
+
+    def get_dof_indices(self, joint_name):
+        self.index_lookups += 1
+        index = int(joint_name.removeprefix("joint"))
+        return SimpleNamespace(numpy=lambda: np.array([index]))
+
+    def set_dof_velocities(self, velocities, dof_indices):
+        self.velocity_calls.append((velocities, dof_indices))
+
+
+class MultirotorVisualTests(unittest.TestCase):
+    def setUp(self):
+        FakeArticulation.instances = []
+        namespace = dict(Articulation=FakeArticulation)
+        self.Multirotor = load_class(
+            "vehicles/multirotor.py",
+            "Multirotor",
+            namespace,
+            methods={
+                "start",
+                "stop",
+                "_get_rotor_dof_index",
+                "handle_propeller_visual",
+            },
+        )
+
+    def test_articulation_retries_until_ready_then_caches_validity(self):
+        drone = self.Multirotor()
+        drone._stage_prefix = "/World/drone"
+        drone._thrusters = SimpleNamespace(rot_dir=[1, -1, 1, -1])
+        drone.start()
+        articulation = FakeArticulation.instances[0]
+
+        drone.handle_propeller_visual(0, 1.0)
+        self.assertEqual(articulation.validity_checks, 1)
+        self.assertEqual(articulation.velocity_calls, [])
+
+        articulation.valid = True
+        drone.handle_propeller_visual(0, 1.0)
+        drone.handle_propeller_visual(0, 1.0)
+        self.assertEqual(articulation.validity_checks, 2)
+        self.assertEqual(articulation.index_lookups, 1)
+        self.assertEqual(len(articulation.velocity_calls), 2)
+        self.assertTrue(drone._articulation_validated)
+
+        drone.stop()
+        self.assertIsNone(drone._articulation)
+        self.assertFalse(drone._articulation_validated)
+        self.assertEqual(drone._rotor_dof_indices, {})
 
 
 class PersonTests(unittest.TestCase):
