@@ -192,6 +192,13 @@ class PegasusInterface:
         """
         return self._vehicle_manager.vehicles
 
+    def enable_fleet_physics_batching(self):
+        """Enable one shared PhysX tensor path for all spawned vehicles.
+
+        Call this after spawning the fleet and before starting simulation.
+        """
+        return self._vehicle_manager.enable_fleet_physics_batching()
+
     def get_default_environments(self):
         """
         Method that returns a dictionary containing all the default simulation environments and their path

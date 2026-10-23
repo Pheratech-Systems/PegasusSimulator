@@ -160,6 +160,12 @@ class Multirotor(Vehicle):
         for backend in self._backends:
             backend.update(dt)
 
+    def get_physics_body_parts(self):
+        """Rigid bodies used by the exact multirotor force model."""
+        return ("/body",) + tuple(
+            "/rotor" + str(i) for i in range(self._thrusters._num_rotors)
+        )
+
     def _get_rotor_dof_index(self, rotor_number: int) -> int | None:
         """Return the cached DOF index for the given rotor joint, computing it on first use."""
         if rotor_number in self._rotor_dof_indices:

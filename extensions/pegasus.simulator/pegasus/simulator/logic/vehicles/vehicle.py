@@ -75,6 +75,9 @@ class Vehicle:
         self._body_rigid_prim: RigidPrim | None = None
         self._body_rigid_prim_validated = False
         self._rigid_prims: dict[str, RigidPrim] = {}
+        # Optional fleet dispatcher. When present, it owns the physics tensor
+        # views and batches state reads and force writes for every vehicle.
+        self._fleet_physics_dispatcher = None
         # Per-vehicle scratch buffers; the physics callbacks use them synchronously.
         self._force_buffer = np.empty((1, 3), dtype=np.float32)
         self._torque_buffer = np.empty((1, 3), dtype=np.float32)
@@ -237,12 +240,14 @@ class Vehicle:
         if not self._sim_running:
             self._sim_running = True
 
-            # Create (or re-create) the rigid prim wrapper now that physics is ready
+            # Create (or re-create) the rigid prim wrapper now that physics is
+            # ready. Fleet mode owns a shared wrapper instead.
             self._rigid_prims.clear()
-            body_path = self._stage_prefix + "/body"
-            self._body_rigid_prim = RigidPrim(paths=body_path)
-            self._body_rigid_prim_validated = False
-            self._rigid_prims[body_path] = self._body_rigid_prim
+            if getattr(self, "_fleet_physics_dispatcher", None) is None:
+                body_path = self._stage_prefix + "/body"
+                self._body_rigid_prim = RigidPrim(paths=body_path)
+                self._body_rigid_prim_validated = False
+                self._rigid_prims[body_path] = self._body_rigid_prim
 
             # Initialize the sensors
             for sensor in self._sensors:
@@ -324,6 +329,13 @@ class Vehicle:
             pos (list): Position offset in local body frame. Defaults to [0.0, 0.0, 0.0].
             body_part (str): Rigid body sub-path relative to the vehicle stage prefix. Defaults to "/body".
         """
+        fleet_dispatcher = getattr(self, "_fleet_physics_dispatcher", None)
+        if fleet_dispatcher is not None:
+            fleet_dispatcher.queue_force(
+                self, body_part, force, pos
+            )
+            return
+
         rigid_prim = self._get_rigid_prim(body_part)
         if rigid_prim is None:
             return
@@ -342,6 +354,13 @@ class Vehicle:
             torque (list): A 3-dimensional vector of floats with the torque [Tx, Ty, Tz] on the body axis of the vehicle according to a FLU convention.
             body_part (str): Rigid body sub-path relative to the vehicle stage prefix. Defaults to "/body".
         """
+        fleet_dispatcher = getattr(self, "_fleet_physics_dispatcher", None)
+        if fleet_dispatcher is not None:
+            fleet_dispatcher.queue_torque(
+                self, body_part, torque
+            )
+            return
+
         rigid_prim = self._get_rigid_prim(body_part)
         if rigid_prim is None:
             return
@@ -373,10 +392,34 @@ class Vehicle:
         linear_vel = linear_vels.numpy()[0]   # [vx, vy, vz] in world frame
         ang_vel_world = angular_vels.numpy()[0]  # [wx, wy, wz] in world frame, rad/s
 
-        # Convert warp float32 outputs to float64 so ROS 2 message fields pass PyFloat_Check
-        pos = pos.astype(np.float64)
-        linear_vel = linear_vel.astype(np.float64)
-        ang_vel_world = ang_vel_world.astype(np.float64)
+        self.update_state_from_physics(
+            pos,
+            quat_wxyz,
+            linear_vel,
+            ang_vel_world,
+            dt,
+        )
+
+    def update_state_from_physics(
+        self,
+        pos,
+        quat_wxyz,
+        linear_vel,
+        ang_vel_world,
+        dt: float,
+    ):
+        """Update state from already-read PhysX values.
+
+        Fleet physics uses this entry point after one batched tensor read. The
+        conversion and frame math are intentionally shared with standalone
+        vehicle mode so both paths produce the same state.
+        """
+        # Convert float32 physics outputs to float64 so ROS 2 fields pass
+        # PyFloat_Check and retain the legacy public state types.
+        pos = np.asarray(pos, dtype=np.float64)
+        quat_wxyz = np.asarray(quat_wxyz, dtype=np.float64)
+        linear_vel = np.asarray(linear_vel, dtype=np.float64)
+        ang_vel_world = np.asarray(ang_vel_world, dtype=np.float64)
 
         # Get the linear acceleration of the body relative to the inertial frame, expressed in the inertial frame
         linear_acceleration = (linear_vel - self._state.linear_velocity) / dt if dt > 0.0 else np.zeros(3)
@@ -411,9 +454,31 @@ class Vehicle:
     def _physics_step(self, dt: float, context=None):
         """Run the vehicle's per-step work through one physics callback."""
         self.update_state(dt, context)
+        self._physics_step_after_state(dt, context)
+
+    def _physics_step_after_state(self, dt: float, context=None):
+        """Run per-step work after a standalone or fleet state update."""
         self.update(dt, context)
         self.update_sensors(dt, context)
         self.update_sim_state(dt, context)
+
+    def get_physics_body_parts(self):
+        """Return rigid-body subpaths that may receive forces or torques."""
+        return ("/body",)
+
+    def attach_fleet_physics_dispatcher(self, dispatcher):
+        """Give physics tensor ownership to a fleet dispatcher.
+
+        This must be called after construction and before the simulation starts.
+        """
+        if getattr(self, "_sim_running", False):
+            raise RuntimeError(
+                "Fleet physics batching must be enabled before simulation starts"
+            )
+        self._fleet_physics_dispatcher = dispatcher
+        if self._cb_update is not None:
+            SimulationManager.deregister_callback(self._cb_update)
+            self._cb_update = None
 
     def start(self):
         """

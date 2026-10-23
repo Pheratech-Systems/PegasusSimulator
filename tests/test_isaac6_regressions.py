@@ -243,6 +243,25 @@ class VehicleTests(unittest.TestCase):
             ],
         )
 
+    def test_fleet_dispatcher_owns_force_and_torque_submission(self):
+        vehicle = self.Vehicle.__new__(self.Vehicle)
+        vehicle._sim_running = False
+        vehicle._fleet_physics_dispatcher = None
+        vehicle._cb_update = 41
+        dispatcher = Mock()
+        vehicle.attach_fleet_physics_dispatcher(dispatcher)
+
+        self.sim.deregister_callback.assert_called_with(41)
+        self.assertIsNone(vehicle._cb_update)
+        vehicle.apply_force([1, 2, 3], [0.1, 0.2, 0.3], "/rotor0")
+        vehicle.apply_torque([4, 5, 6], "/body")
+        dispatcher.queue_force.assert_called_once_with(
+            vehicle, "/rotor0", [1, 2, 3], [0.1, 0.2, 0.3]
+        )
+        dispatcher.queue_torque.assert_called_once_with(
+            vehicle, "/body", [4, 5, 6]
+        )
+
     def test_unready_replacement_is_not_used_or_cached(self):
         vehicle = self.vehicle()
         FakeRigidPrim.ready = False
@@ -314,6 +333,121 @@ class VehicleTests(unittest.TestCase):
         )
         self.assertEqual(vehicle._cb_render, 17)
         vehicle.__del__()
+
+
+class FakeFleetArray:
+    def __init__(self, values):
+        self.values = np.asarray(values, dtype=np.float32)
+        self.numpy_calls = 0
+
+    def numpy(self):
+        self.numpy_calls += 1
+        return self.values.copy()
+
+
+class FakeFleetRigidPrim:
+    instances = []
+
+    def __init__(self, paths):
+        self.paths = list(paths)
+        self.valid = True
+        self.pose_calls = 0
+        self.velocity_calls = 0
+        self.force_calls = []
+        self.instances.append(self)
+
+    def is_physics_tensor_entity_valid(self):
+        return self.valid
+
+    def get_world_poses(self):
+        self.pose_calls += 1
+        count = len(self.paths)
+        return (
+            FakeFleetArray([[i, i + 1, i + 2] for i in range(count)]),
+            FakeFleetArray([[1, 0, 0, 0]] * count),
+        )
+
+    def get_velocities(self):
+        self.velocity_calls += 1
+        count = len(self.paths)
+        return (
+            FakeFleetArray([[i + 3, i + 4, i + 5] for i in range(count)]),
+            FakeFleetArray([[0.1, 0.2, 0.3]] * count),
+        )
+
+    def apply_forces_and_torques_at_pos(self, **kwargs):
+        self.force_calls.append({
+            key: value.copy() if isinstance(value, np.ndarray) else value
+            for key, value in kwargs.items()
+        })
+
+
+class FleetPhysicsTests(unittest.TestCase):
+    def setUp(self):
+        FakeFleetRigidPrim.instances = []
+        self.Dispatcher = load_class(
+            "fleet_physics.py",
+            "FleetPhysicsDispatcher",
+            dict(np=np, RigidPrim=FakeFleetRigidPrim),
+        )
+
+    @staticmethod
+    def vehicle(path, thrust):
+        vehicle = SimpleNamespace(prim_path=path)
+        vehicle.get_physics_body_parts = lambda: (
+            "/body", "/rotor0", "/rotor1", "/rotor2", "/rotor3"
+        )
+        vehicle.state_updates = []
+        vehicle.update_state_from_physics = lambda *args: vehicle.state_updates.append(args)
+
+        def step_after_state(dt, context):
+            vehicle.dispatcher.queue_force(vehicle, "/rotor0", [0, 0, thrust], [0, 0, 0])
+            vehicle.dispatcher.queue_force(vehicle, "/body", [1, 0, 0], [0, 0, 0])
+            vehicle.dispatcher.queue_torque(vehicle, "/body", [0, 0, 0.5])
+
+        vehicle._physics_step_after_state = step_after_state
+        return vehicle
+
+    def test_two_vehicle_step_uses_one_read_and_one_force_submission(self):
+        vehicles = [self.vehicle("/World/a", 2.0), self.vehicle("/World/b", 3.0)]
+        dispatcher = self.Dispatcher(vehicles)
+        for vehicle in vehicles:
+            vehicle.dispatcher = dispatcher
+        dispatcher.start()
+        dispatcher.physics_step(0.004, "context")
+
+        body_view, force_view = FakeFleetRigidPrim.instances
+        self.assertEqual(body_view.paths, ["/World/a/body", "/World/b/body"])
+        self.assertEqual(body_view.pose_calls, 1)
+        self.assertEqual(body_view.velocity_calls, 1)
+        self.assertEqual(len(force_view.force_calls), 1)
+        self.assertEqual(len(vehicles[0].state_updates), 1)
+        self.assertEqual(len(vehicles[1].state_updates), 1)
+
+        call = force_view.force_calls[0]
+        self.assertEqual(
+            force_view.paths,
+            [
+                "/World/a/body", "/World/a/rotor0", "/World/a/rotor1",
+                "/World/a/rotor2", "/World/a/rotor3", "/World/b/body",
+                "/World/b/rotor0", "/World/b/rotor1", "/World/b/rotor2",
+                "/World/b/rotor3",
+            ],
+        )
+        np.testing.assert_array_equal(call["forces"][0], [1, 0, 0])
+        np.testing.assert_array_equal(call["forces"][1], [0, 0, 2])
+        np.testing.assert_array_equal(call["forces"][5], [1, 0, 0])
+        np.testing.assert_array_equal(call["forces"][6], [0, 0, 3])
+        np.testing.assert_array_equal(call["torques"][0], [0, 0, 0.5])
+        np.testing.assert_array_equal(call["torques"][5], [0, 0, 0.5])
+        self.assertTrue(call["local_frame"])
+
+    def test_different_force_positions_on_one_body_are_rejected(self):
+        vehicle = self.vehicle("/World/a", 1.0)
+        dispatcher = self.Dispatcher([vehicle])
+        dispatcher.queue_force(vehicle, "/body", [1, 0, 0], [0, 0, 0])
+        with self.assertRaisesRegex(ValueError, "different positions"):
+            dispatcher.queue_force(vehicle, "/body", [1, 0, 0], [1, 0, 0])
 
 
 class FakeArticulation:

@@ -9,6 +9,9 @@ __all__ = ["VehicleManager"]
 
 import carb
 from threading import Lock
+from isaacsim.core.simulation_manager import SimulationManager, SimulationEvent
+
+from pegasus.simulator.logic.fleet_physics import FleetPhysicsDispatcher
 
 
 class VehicleManager:
@@ -35,7 +38,11 @@ class VehicleManager:
         """
         Constructor for the vehicle manager class.
         """
-        pass
+        if VehicleManager._is_initialized:
+            return
+        VehicleManager._is_initialized = True
+        self._fleet_physics_dispatcher = None
+        self._fleet_callback_ids = []
 
     """
     Properties
@@ -99,7 +106,56 @@ class VehicleManager:
         Method that will delete all the vehicles that were spawned from the vehicle manager.
         """
 
+        self.disable_fleet_physics_batching()
         VehicleManager._vehicles.clear()
+
+    def enable_fleet_physics_batching(self):
+        """Replace per-vehicle tensor callbacks with one fleet callback.
+
+        This is intentionally opt-in and must be called after all vehicles are
+        spawned but before the timeline starts.
+        """
+        if self._fleet_physics_dispatcher is not None:
+            return self._fleet_physics_dispatcher
+
+        dispatcher = FleetPhysicsDispatcher(VehicleManager._vehicles.values())
+        for vehicle in VehicleManager._vehicles.values():
+            vehicle.attach_fleet_physics_dispatcher(dispatcher)
+
+        self._fleet_callback_ids = [
+            SimulationManager.register_callback(
+                dispatcher.start,
+                SimulationEvent.SIMULATION_STARTED,
+            ),
+            SimulationManager.register_callback(
+                dispatcher.stop,
+                SimulationEvent.SIMULATION_STOPPED,
+            ),
+            SimulationManager.register_callback(
+                dispatcher.physics_step,
+                SimulationEvent.PHYSICS_POST_STEP,
+            ),
+        ]
+        self._fleet_physics_dispatcher = dispatcher
+        carb.log_info(
+            "Enabled fleet physics batching for "
+            + str(len(VehicleManager._vehicles))
+            + " vehicles"
+        )
+        return dispatcher
+
+    def disable_fleet_physics_batching(self):
+        """Release fleet callbacks during scene teardown."""
+        dispatcher = getattr(self, "_fleet_physics_dispatcher", None)
+        if dispatcher is not None:
+            dispatcher.stop()
+        for callback_id in getattr(self, "_fleet_callback_ids", []):
+            try:
+                SimulationManager.deregister_callback(callback_id)
+            except Exception:
+                pass
+        self._fleet_callback_ids = []
+        self._fleet_physics_dispatcher = None
 
     def __new__(cls):
         """Method that allocated memory for a new vehicle_manager. Since the VehicleManager follows a singleton pattern,
@@ -121,5 +177,7 @@ class VehicleManager:
 
     def __del__(self):
         """Destructor for the object"""
+        self.disable_fleet_physics_batching()
         VehicleManager._instance = None
+        VehicleManager._is_initialized = False
         return
